@@ -1,0 +1,358 @@
+// ============================================================================
+// AuthForge — Prisma Schema
+//
+// Design notes (see README.md "Database schema" section for the full writeup):
+//   - Users authenticate either via password (hashed, never stored in plain
+//     text) or via a linked OAuth Account (Auth.js-compatible shape).
+//   - Sessions are stored server-side (database strategy) so that a session
+//     can be looked up, listed, and revoked individually — a JWT-only
+//     strategy cannot support "revoke this device" without a blocklist.
+//   - Organizations are multi-tenant containers. A User can belong to many
+//     Organizations through OrganizationMember, which carries a Role.
+//   - Role/Permission is modelled as data (not a hardcoded enum only) so
+//     custom roles can be introduced later without a schema migration,
+//     while a `key` enum-like string keeps the four built-in roles cheap
+//     to check in middleware.
+//   - ApiKey stores only a hash of the secret (`keyHash`) plus a short,
+//     non-secret `prefix` used for lookup and display (e.g. "af_live_9k2x").
+//   - AuditLog / SecurityEvent are append-only and intentionally denormalized
+//     (actor label, IP, user agent captured as plain strings) so history
+//     survives the referenced user/session being deleted later.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url       = env("DATABASE_URL")       // pooled — používá aplikace za běhu
+  directUrl = env("DIRECT_URL")         // direct — používá jen Prisma Migrate
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id                String    @id @default(cuid())
+  email             String    @unique
+  emailVerified     DateTime?
+  name              String?
+  image             String?
+
+  // Password auth. Null when the user only ever signed up via OAuth.
+  passwordHash      String?
+
+  // Two-factor state lives on the user row for a fast "is 2FA required" check;
+  // the TOTP secret itself lives in the related TwoFactor record so it can be
+  // rotated/removed independently and never touches a list/select of User.
+  twoFactorEnabled  Boolean   @default(false)
+
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  accounts            Account[]
+  sessions            Session[]
+  memberships         OrganizationMember[]
+  apiKeys             ApiKey[]
+  applications        Application[]
+  twoFactor           TwoFactor?
+  backupCodes         BackupCode[]
+  auditLogs           AuditLog[]            @relation("AuditActor")
+  securityEvents      SecurityEvent[]
+  passwordResetTokens PasswordResetToken[]
+
+  @@index([email])
+}
+
+// OAuth-linked identity (Auth.js "Account" shape: one row per provider link).
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type              String
+  provider          String
+  providerAccountId String
+
+  refresh_token            String? @db.Text
+  refresh_token_expires_in Int?
+  access_token             String? @db.Text
+  expires_at               Int?
+  token_type               String?
+  scope                    String?
+  id_token                 String? @db.Text
+  session_state            String?
+
+  createdAt         DateTime @default(now())
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+// Server-side session record. The cookie only holds an opaque, unguessable
+// `sessionToken` — all authorization state (user, expiry, revocation) is
+// looked up here, which is what makes "revoke this device" possible.
+model Session {
+  id             String   @id @default(cuid())
+  sessionToken   String   @unique
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Device/browser metadata, parsed once from the User-Agent at login time.
+  device         String?
+  browser        String?
+  os             String?
+  ipAddress      String? // abstraction: normally truncated/anonymized, see lib/security/ip.ts
+  approxLocation String? // abstraction: coarse "City, Country" derived from IP, never precise geo
+
+  rememberDevice Boolean  @default(false)
+
+  createdAt      DateTime @default(now())
+  lastActiveAt   DateTime @default(now())
+  expiresAt      DateTime
+
+  revokedAt      DateTime?
+  revokedReason  String? // "user" | "user_revoke_all" | "password_change" | "expired"
+
+  @@index([userId])
+  @@index([sessionToken])
+}
+
+// Email verification / magic-link style single-use tokens. Same shape Auth.js
+// uses for its own Email provider (identifier + token), but AuthForge's own
+// register/verify-email flow (lib/auth/tokens.ts) is what actually reads and
+// writes this table — Auth.js is only wired up for OAuth here, so it never
+// touches this model. Field named `expiresAt` (AuthForge's own convention)
+// rather than Auth.js's default `expires`; harmless since Auth.js doesn't
+// query this table in this app.
+model VerificationToken {
+  identifier String // usually the email being verified
+  token      String   @unique
+  expiresAt  DateTime
+
+  @@unique([identifier, token])
+}
+
+model PasswordResetToken {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String   @unique // the raw token is emailed; only its hash is stored
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Two-factor authentication
+// ---------------------------------------------------------------------------
+
+model TwoFactor {
+  id         String   @id @default(cuid())
+  userId     String   @unique
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // TOTP secret, base32-encoded. Encrypted at rest via lib/security/crypto.ts
+  // (AES-256-GCM using AUTH_SECRET-derived key) before it ever reaches the DB.
+  secretEncrypted String
+
+  verifiedAt DateTime? // null until the user confirms one correct code
+  createdAt  DateTime  @default(now())
+}
+
+model BackupCode {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash  String // each backup code is hashed like a password, shown once
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Organizations & RBAC
+// ---------------------------------------------------------------------------
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members      OrganizationMember[]
+  applications Application[]
+  apiKeys      ApiKey[]
+  auditLogs    AuditLog[]
+}
+
+// Built-in role keys. Kept as a Prisma enum for cheap, indexable comparisons
+// in RBAC middleware; see lib/auth/rbac.ts for the permission matrix these
+// map to. Modelling fine-grained custom permissions is left as a documented
+// extension point (see README) rather than built out fully here.
+enum RoleKey {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+model OrganizationMember {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  role           RoleKey      @default(MEMBER)
+
+  invitedAt      DateTime     @default(now())
+  joinedAt       DateTime?
+
+  @@unique([organizationId, userId])
+  @@index([userId])
+}
+
+// Optional fine-grained permission catalogue. Roles are checked directly via
+// RoleKey in the common path; this table backs an admin-configurable
+// "custom permission" story without forcing every deployment to use it.
+model Permission {
+  id          String  @id @default(cuid())
+  key         String  @unique // e.g. "members.invite", "apiKeys.revoke"
+  description String
+}
+
+// ---------------------------------------------------------------------------
+// Applications & API keys (developer-facing surface)
+// ---------------------------------------------------------------------------
+
+// A registered "consumer" of AuthForge, e.g. the demo "My SaaS" app.
+// Mirrors what Clerk/Auth0 call an "Application"/"Tenant client".
+model Application {
+  id             String        @id @default(cuid())
+  name           String
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  ownerId        String
+  owner          User          @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  clientId       String        @unique
+  clientSecretHash String
+
+  redirectUrls   String[]      @default([])
+
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([ownerId])
+  @@index([organizationId])
+}
+
+model ApiKey {
+  id             String        @id @default(cuid())
+  name           String
+  prefix         String // non-secret, shown in the UI, e.g. "af_live_9k2x"
+  keyHash        String // hash of the full secret; the secret itself is never stored
+
+  userId         String
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+
+  scopes         String[]      @default([])
+
+  createdAt      DateTime      @default(now())
+  lastUsedAt     DateTime?
+  expiresAt      DateTime?
+  revokedAt      DateTime?
+
+  @@index([userId])
+  @@index([organizationId])
+  @@index([prefix])
+}
+
+// ---------------------------------------------------------------------------
+// Audit / security logging
+// ---------------------------------------------------------------------------
+
+enum AuditEvent {
+  LOGIN_SUCCESS
+  LOGIN_FAILED
+  ACCOUNT_DELETED
+  LOGOUT
+  REGISTER
+  EMAIL_VERIFIED
+  PASSWORD_CHANGED
+  PASSWORD_RESET_REQUESTED
+  PASSWORD_RESET_COMPLETED
+  EMAIL_CHANGED
+  TWO_FACTOR_ENABLED
+  TWO_FACTOR_DISABLED
+  TWO_FACTOR_CHALLENGE_FAILED
+  BACKUP_CODE_USED
+  API_KEY_CREATED
+  API_KEY_REVOKED
+  SESSION_REVOKED
+  SESSION_REVOKED_ALL
+  ORG_CREATED
+  ORG_MEMBER_INVITED
+  ORG_MEMBER_ROLE_CHANGED
+  ORG_MEMBER_REMOVED
+  APPLICATION_CREATED
+}
+
+// Append-only audit trail. Actor fields are denormalized (id + label) so the
+// row remains meaningful even if the user is later deleted.
+model AuditLog {
+  id             String        @id @default(cuid())
+  event          AuditEvent
+
+  actorId        String?
+  actor          User?         @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  actorLabel     String // denormalized email/name snapshot at time of event
+
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+
+  ipAddress      String? // abstraction, see lib/security/ip.ts
+  userAgent      String?
+
+  metadata       Json?         // event-specific extra context, e.g. { targetUserId }
+
+  createdAt      DateTime      @default(now())
+
+  @@index([actorId])
+  @@index([organizationId])
+  @@index([event])
+  @@index([createdAt])
+}
+
+// Lower-level security telemetry, distinct from the human-facing AuditLog:
+// used to drive rate-limiting / brute-force abstractions (see
+// lib/security/rate-limit.ts) rather than to be displayed 1:1 in the UI.
+enum SecurityEventType {
+  FAILED_LOGIN_ATTEMPT
+  ACCOUNT_LOCKED
+  RATE_LIMIT_TRIGGERED
+  SUSPICIOUS_TOKEN_REUSE
+}
+
+model SecurityEvent {
+  id        String            @id @default(cuid())
+  type      SecurityEventType
+  userId    String?
+  user      User?             @relation(fields: [userId], references: [id], onDelete: SetNull)
+  identifier String // email or IP bucket key the event is scoped to
+  ipAddress String?
+  metadata  Json?
+  createdAt DateTime          @default(now())
+
+  @@index([identifier])
+  @@index([userId])
+}
