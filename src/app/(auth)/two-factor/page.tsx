@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { Suspense, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { apiFetch, ApiError } from "@/lib/api-client";
 import { AlertCircle, ShieldCheck } from "lucide-react";
 
-export default function TwoFactorPage() {
+function TwoFactorForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const challengeToken = searchParams.get("token") ?? "";
@@ -87,5 +87,13 @@ export default function TwoFactorPage() {
         </form>
       </CardContent>
     </Card>
+  );
+}
+
+export default function TwoFactorPage() {
+  return (
+    <Suspense fallback={null}>
+      <TwoFactorForm />
+    </Suspense>
   );
 }
