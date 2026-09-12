@@ -1,11 +1,11 @@
 import { PrismaClient, RoleKey } from "@prisma/client";
-import argon2 from "argon2";
+import { hash, Algorithm } from "@node-rs/argon2";
 import { randomBytes, createHash } from "node:crypto";
 
 const prisma = new PrismaClient();
 
 async function main() {
-  const passwordHash = await argon2.hash("Password123!", { type: argon2.argon2id });
+  const passwordHash = await hash("Password123!", { algorithm: Algorithm.Argon2id });
 
   const user = await prisma.user.upsert({
     where: { email: "demo@authforge.dev" },
